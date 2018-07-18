@@ -1,0 +1,205 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+# This stack creates a lambda to back a custom resource including and IAM role and policy
+# Additionally it creates an SNS topic, a queue and a subscription to demonstrate
+# how the custom resource can manage the filter policy of the subscription
+# You can learn more about subscription filter policies on
+#  https://docs.aws.amazon.com/sns/latest/dg/message-filtering.html
+Description: Demonstration stack to set filter policies on SNS topics
+Resources:
+  # FilterPolicyLambdaRole, FilterPolicyLambdaPermissions and FilterPolicyLambda
+  # are necessary to define the custom resource. This is the part you want to
+  # copy into your own stack
+  FilterPolicyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+  FilterPolicyLambdaPermissions:
+    Type: AWS::IAM::Policy
+    DependsOn: 
+    - FilterPolicyLambdaRole
+    Properties:
+      PolicyName: SnsFilterPolicyReadWrite
+      Roles:
+      - !Ref FilterPolicyLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Resource: arn:aws:logs:*:*:*
+        - Effect: Allow
+          Action:
+          - sns:SetSubscriptionAttributes
+          - sns:GetSubscriptionAttributes
+          - sns:ListTopics
+          - sns:ListSubscriptionsByTopic
+          Resource: arn:aws:sns:*:*:*
+  FilterPolicyLambda:
+    # This is defined as an in-line lambda to make it easy to copy/paste into your stack
+    Type: AWS::Lambda::Function
+    DependsOn: FilterPolicyLambdaPermissions
+    Properties:
+      Description: CloudFormation helper to set FilterPolicy on an SNS subscription
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt FilterPolicyLambdaRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: |
+          import sys
+          import json
+          import boto3
+          import cfnresponse
+          client = boto3.client('sns', region_name='eu-west-1')
+          def lambda_handler(event, context):
+            try:
+              # print(json.dumps(event))
+              responseData = {}
+              if (event['RequestType'] == 'Create' or event['RequestType'] == 'Update'):
+                if not keyspresent(event):
+                  responseData['FailReason'] = "Did not find EndPoint or TopicArn in configuration"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                  return
+                endpoint = event['ResourceProperties']['Endpoint']
+                topicarn = event['ResourceProperties']['TopicArn']
+                policy = event['ResourceProperties']['FilterPolicy'] if 'FilterPolicy' in event['ResourceProperties'] else {}
+                if event['RequestType'] == 'Update':
+                  if endpoint != event['OldResourceProperties']['Endpoint'] or topicarn != event['OldResourceProperties']['TopicArn']:
+                    filterpolicysetter(event['OldResourceProperties']['TopicArn'], event['OldResourceProperties']['Endpoint'], {}, False)
+                filterpolicysetter(topicarn, endpoint, policy)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, getphysicalid(event))
+              elif event['RequestType'] == 'Delete':
+                if keyspresent(event):
+                  filterpolicysetter(event['ResourceProperties']['TopicArn'], event['ResourceProperties']['Endpoint'], {}, False)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, getphysicalid(event))
+                else:
+                  # This happens mainly in rollbacks
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                responseData['FailReason'] = "Did not find an action to execute"
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData, getphysicalid(event))
+            except:
+              faildata = {}
+              faildata['FailReason'] = "Exception: {0!s}".format(sys.exc_info()[0])
+              cfnresponse.send(event, context, cfnresponse.FAILED, faildata, getphysicalid(event))
+
+          def filterpolicysetter(topicarn, endpoint, policy, raiseonempty = True):
+            stringpolicy = policy if isinstance(policy, str) else json.dumps(policy)
+            subsresponse = client.list_subscriptions_by_topic(TopicArn = topicarn)
+            # Will fail if topic has more than 100 subscriptions
+            sub = next((x for x in subsresponse['Subscriptions'] if x['Endpoint'] == endpoint), None)
+            if sub != None:
+              subsarn = sub['SubscriptionArn']
+              client.set_subscription_attributes(SubscriptionArn=subsarn,
+                AttributeName = 'FilterPolicy',
+                AttributeValue = stringpolicy
+                )
+            elif raiseonempty:
+              raise ValueError('Could not find subscription ' )
+          def getphysicalid(event):
+            try:
+              return '{}:{}'.format(event['ResourceProperties']['TopicArn'], event['ResourceProperties']['Endpoint'])
+            except:
+              return None
+          def keyspresent(event):
+            return 'ResourceProperties' in event and 'TopicArn' in event['ResourceProperties'] and 'Endpoint' in event['ResourceProperties']
+  # Now we need to set up an SNS topic
+  MyFilteringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: FilterTest
+      TopicName: FilterTest
+  MyFilteredQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FilterReceiver
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+  MyFilteredQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    DependsOn: 
+    - MyFilteredQueue
+    - MyFilteringTopic
+    Properties:
+      Queues:
+      - !Ref MyFilteredQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: MultiplexLoggingQueuePolicy
+        Statement:
+        - Sid: Stmt1531730811
+          Effect: Allow
+          Action:
+          - sqs:SendMessage
+          Principal: "*"
+          Resource: "*"
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !Ref MyFilteringTopic
+  MyFilterSubscription:
+    Type: "AWS::SNS::Subscription"
+    DependsOn: MyFilteredQueuePolicy
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt MyFilteredQueue.Arn
+      TopicArn: !Ref MyFilteringTopic
+  # Let's add another SQS queue and subscription
+  MyOtherFilteredQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FilterReceiverToo
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+  MyOtherFilterSubscription:
+    Type: "AWS::SNS::Subscription"
+    DependsOn: MyFilteredQueuePolicy
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt MyOtherFilteredQueue.Arn
+      TopicArn: !Ref MyFilteringTopic
+
+  # This is the actual custom resource. 
+  MySubscriptionFilterPolicy:
+    Type: Custom::SnsSubscriptionFilterPolicy
+    DependsOn:
+    - FilterPolicyLambda
+    - MyFilterSubscription
+    Properties:
+      ServiceToken: !GetAtt FilterPolicyLambda.Arn
+      TopicArn: !Ref MyFilteringTopic
+      Endpoint: !GetAtt MyFilteredQueue.Arn
+      # Implementing the filter policy from https://docs.aws.amazon.com/sns/latest/dg/message-filtering.html
+      FilterPolicy: '{"store": ["example_corp"], "event": [{"anything-but":"order_cancelled"}], "customer_interests": ["rugby", "football", "baseball"], "price_usd": [{"numeric":[">=", 100]}]}'
+  MyOtherSubscriptionFilterPolicy:
+    Type: Custom::SnsSubscriptionFilterPolicy
+    DependsOn:
+    - FilterPolicyLambda
+    - MyOtherFilterSubscription
+    Properties:
+      ServiceToken: !GetAtt FilterPolicyLambda.Arn
+      TopicArn: !Ref MyFilteringTopic
+      Endpoint: !GetAtt MyOtherFilteredQueue.Arn
+      # You can write out the policy in yaml if you like. 
+      FilterPolicy: 
+        store: 
+        - different_example_corp
+        customer_interests:
+        - golf
+        - polo
+        event:
+        - anything-but: order_cancelled
