@@ -19,9 +19,14 @@ Once you have added the lambda you can use it like so:
       # Filterpolicy is the policy you want to attach to the subscription
       FilterPolicy: '{"store": ["example_corp"], "customer_interests": ["rugby", "football", "baseball"]'
 ```
+## Sample Stack
+You can run the sample stack attached here. It will create the lambda, and SNS topic, a couple of SQS queues with subscriptions and put filter policies on them.
+
 
 ## Implementation Choices
 Write to me if you are concerned about some of the points below. If the code ever gets any real use I promíse to improve it.
+### No support for subscription attributes 
+I think CloudFormation doesn't support setting subscription attributes (i.e. "Raw delivery".) The project could be extended to take on that challenge.
 ### Only one subscription per topic and endpoint
 Unfortunately, CloudFormation doesn't expose the ARN of an SNS subscription, so to find the correct physical resource to update we have to use ARNs of the source topic and the subscription endpoint. This will not work if a topic has multiple subscriptions to the same endpoint. 
 ### Fails on monster topics
